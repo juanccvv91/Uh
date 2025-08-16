@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Dashboard de Transferencia — Receptor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    /* -----------------------------------------
+       Estilos (minimal, monoespaciado, oscuro)
+       ----------------------------------------- */
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@300;400;700&display=swap');
+
+    :root{
+      --bg:#0d1117; --panel:#161b22; --border:#30363d; --ink:#c9d1d9;
+      --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950; --warn:#f2cc60; --err:#f85149;
+    }
+
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;padding:28px;
+      font-family:'Roboto Mono', monospace;
+      background:var(--bg); color:var(--ink);
+      display:flex;align-items:flex-start;justify-content:center;
+    }
+
+    .container{
+      width:100%; max-width:1000px;
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:20px;
+      box-shadow:0 16px 40px rgba(0,0,0,.45);
+    }
+
+    h1{margin:0 0 14px;color:var(--accent);font-weight:400;text-align:center}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .pill{padding:6px 10px;border-radius:999px;background:#0f172a;border:1px solid var(--border);font-size:13px;color:var(--muted)}
+    .pill.ok{color:var(--ok)}
+    .pill.err{color:var(--err)}
+
+    .controls{display:flex;gap:10px;align-items:center;margin-top:12px}
+    .btn{background:var(--accent);color:#fff;border:0;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:700}
+    .btn.small{padding:6px 10px;font-size:13px}
+    .btn.ghost{background:transparent;border:1px solid var(--border);color:var(--muted)}
+
+    .status-box{margin-top:14px;padding:12px;border-radius:8px;background:#071019;border:1px dashed var(--border);min-height:92px;color:var(--muted;);font-size:13px;white-space:pre-wrap;overflow:auto}
+    .uploads{margin-top:18px;display:flex;flex-direction:column;gap:12px}
+
+    .upload{
+      background:#0e131b;border:1px solid var(--border);padding:12px;border-radius:10px;
+      display:flex;flex-direction:column;gap:8px;
+    }
+    .upload .title{display:flex;justify-content:space-between;align-items:center;gap:12px}
+    .name{color:#a5d6ff;font-weight:700}
+    .meta{color:var(--muted);font-size:13px}
+    .bar{height:12px;background:#0b0f14;border-radius:8px;border:1px solid #1f2630;overflow:hidden}
+    .bar > div{height:100%;width:0;background:var(--accent);transition:width .18s linear}
+    .kv{display:grid;grid-template-columns:120px 1fr;gap:6px;color:var(--muted);font-size:13px}
+
+    .download-btn{margin-top:8px;display:inline-block;padding:8px 12px;background:var(--ok);color:#052018;border-radius:8px;text-decoration:none;font-weight:700}
+    .hint{font-size:12px;color:var(--muted);margin-top:6px}
+
+    /* responsive */
+    @media (max-width:600px){
+      .row{flex-direction:column;align-items:flex-start}
+    }
+  </style>
+</head>
+<body>
+  <div class="container" role="main">
+    <h1>Servidor de Archivos — Receptor</h1>
+
+    <div class="row">
+      <span id="wsState" class="pill">WS: desconectado</span>
+      <span id="ipTag" class="pill">IP: -</span>
+      <span id="geoTag" class="pill">Geo: -</span>
+      <span id="timeTag" class="pill">Hora: -</span>
+    </div>
+
+    <div class="controls">
+      <button id="btnConnect" class="btn small">Conectar WS</button>
+      <button id="btnRefresh" class="btn ghost small">🔄 Refrescar</button>
+      <div style="flex:1"></div>
+      <div style="font-size:13px;color:var(--muted)">Estado: <span id="connInfo">esperando...</span></div>
+    </div>
+
+    <div id="statusBox" class="status-box">Logs de actividad aparecerán aquí...</div>
+
+    <div class="uploads" id="uploads"></div>
+
+    <div class="hint">Al recibir un archivo aparecerá su nombre, progreso y un botón "Instalar/Descargar".</div>
+  </div>
+
+  <script>
+  /* ==============================================
+     Cliente WebSocket receptor (maneja metadatos + binarios)
+     - Detecta mensajes JSON de control: connected, upload_start, upload_progress, upload_complete
+     - Recibe trozos binarios (ArrayBuffer / Blob) y los agrupa
+     - Crea Blob y muestra botón de descarga al finalizar
+     - Actualiza UI sin recargar la página
+     ============================================== */
+
+  (function(){
+    // --- Configuración
+    const WS_PORT = 8765;                // puerto WS (el servidor usa este por defecto)
+    const RECONNECT_DELAY = 2500;        // ms para reintento
+    const MAX_CHUNKS_FOR_LOG = 10000;    // seguridad para no blow memory (no usado aquí, solo referencia)
+
+    // --- Elementos DOM
+    const wsStateEl = document.getElementById('wsState');
+    const ipTag = document.getElementById('ipTag');
+    const geoTag = document.getElementById('geoTag');
+    const timeTag = document.getElementById('timeTag');
+    const statusBox = document.getElementById('statusBox');
+    const uploadsEl = document.getElementById('uploads');
+    const btnConnect = document.getElementById('btnConnect');
+    const btnRefresh = document.getElementById('btnRefresh');
+    const connInfo = document.getElementById('connInfo');
+
+    // --- Estado runtime
+    let ws = null;
+    let connectedAt = null;
+
+    // mapa filename -> transfer info
+    const transfers = new Map();
+
+    // helper logging
+    function log(msg){
+      const ts = new Date().toLocaleTimeString();
+      statusBox.textContent += `[${ts}] ${msg}\n`;
+      statusBox.scrollTop = statusBox.scrollHeight;
+      connInfo.textContent = msg.split('\n')[0] || msg;
+    }
+
+    function setWSState(text, cls=''){
+      wsStateEl.textContent = 'WS: ' + text;
+      wsStateEl.className = 'pill ' + (cls || '');
+    }
+
+    // crea elemento visual para un archivo si no existe
+    function ensureUIForFile(filename){
+      if(transfers.has(filename)) return transfers.get(filename);
+
+      const root = document.createElement('div');
+      root.className = 'upload';
+
+      const title = document.createElement('div');
+      title.className = 'title';
+      const nameEl = document.createElement('div');
+      nameEl.innerHTML = `📄 <span class="name"></span>`;
+      nameEl.querySelector('.name').textContent = filename;
+      const metaEl = document.createElement('div');
+      metaEl.className = 'meta';
+      metaEl.textContent = '';
+
+      title.appendChild(nameEl);
+      title.appendChild(metaEl);
+      root.appendChild(title);
+
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      const inner = document.createElement('div');
+      bar.appendChild(inner);
+      root.appendChild(bar);
+
+      const kv = document.createElement('div');
+      kv.className = 'kv';
+      kv.innerHTML = `
+        <div>Progreso:</div><div class="p">0%</div>
+        <div>Transferido:</div><div class="s">0 / 0</div>
+        <div>Velocidad:</div><div class="v">0 MB/s</div>
+        <div>Estado:</div><div class="st">Esperando...</div>
+      `;
+      root.appendChild(kv);
+
+      const downloadArea = document.createElement('div');
+      downloadArea.className = 'download-area';
+      root.appendChild(downloadArea);
+
+      uploadsEl.prepend(root);
+
+      const info = {
+        filename,
+        root,
+        metaEl,
+        innerBar: inner,
+        p: kv.querySelector('.p'),
+        s: kv.querySelector('.s'),
+        v: kv.querySelector('.v'),
+        st: kv.querySelector('.st'),
+        downloadArea,
+        chunks: [],          // Array of ArrayBuffer/Blob
+        totalSize: 0,
+        received: 0,
+        startedAt: null
+      };
+
+      transfers.set(filename, info);
+      return info;
+    }
+
+    // Formatea bytes
+    function human(n){
+      if(!n) return '0 B';
+      n = Number(n);
+      if(n < 1024) return n + ' B';
+      let kb = n / 1024;
+      if(kb < 1024) return kb.toFixed(2) + ' KB';
+      let mb = kb / 1024;
+      if(mb < 1024) return mb.toFixed(2) + ' MB';
+      let gb = mb / 1024;
+      return gb.toFixed(2) + ' GB';
+    }
+
+    // Maneja mensajes JSON de control provenientes del servidor
+    function handleControlMessage(obj){
+      if(!obj || !obj.type) return;
+      switch(obj.type){
+        case 'connected': {
+          const p = obj.payload || {};
+          ipTag.textContent = 'IP: ' + (p.ip || '-');
+          geoTag.textContent = 'Geo: ' + ((p.city||'-') + ' / ' + (p.country||'-'));
+          timeTag.textContent = 'Hora: ' + new Date().toLocaleTimeString();
+          log(`✅ Conectado: IP=${p.ip || '-'} (${p.city || '?'}/${p.country || '?'})`);
+          setWSState('conectado', 'ok');
+          break;
+        }
+        case 'info':
+        case 'success':
+        case 'warn':
+        case 'error': {
+          const payload = obj.payload || {};
+          const msg = payload.msg || JSON.stringify(payload);
+          log(`${obj.type.toUpperCase()}: ${msg}`);
+          break;
+        }
+        case 'upload_start': {
+          const pl = obj.payload || {};
+          const name = pl.filename || 'archivo';
+          const it = ensureUIForFile(name);
+          it.totalSize = pl.size || 0;
+          it.received = 0;
+          it.chunks = [];
+          it.startedAt = Date.now();
+          it.metaEl.textContent = pl.readable_size ? `${pl.readable_size}` : human(it.totalSize);
+          it.st.textContent = 'Iniciando...';
+          it.p.textContent = '0%';
+          it.s.textContent = `0 / ${pl.readable_size || human(it.totalSize)}`;
+          it.innerBar.style.width = '0%';
+          log(`📥 Inicio: ${name} (${pl.readable_size || human(it.totalSize)})`);
+          break;
+        }
+        case 'upload_progress': {
+          const pl = obj.payload || {};
+          const name = pl.filename || 'archivo';
+          const it = ensureUIForFile(name);
+          const progress = Math.max(0, Math.min(100, pl.progress || 0));
+          it.innerBar.style.width = progress + '%';
+          it.p.textContent = (progress.toFixed(2) || '0') + '%';
+          it.s.textContent = (pl.readable_sent || human(pl.sent || 0)) + ' / ' + (pl.readable_total || human(pl.total || 0));
+          it.v.textContent = ((pl.speed_mbps || 0).toFixed(2)) + ' MB/s';
+          it.st.textContent = 'Transfiriendo...';
+          break;
+        }
+        case 'upload_complete': {
+          const pl = obj.payload || {};
+          const name = pl.filename || 'archivo';
+          const it = ensureUIForFile(name);
+          it.innerBar.style.width = '100%';
+          it.p.textContent = '100%';
+          it.s.textContent = (pl.readable_size || human(pl.size || 0)) + ' / ' + (pl.readable_size || human(pl.size || 0));
+          it.v.textContent = '-';
+          it.st.textContent = `✅ Archivo recibido (${(pl.duration_sec||0)} s)`;
+          it.root.classList.add('done');
+          // si el servidor nos da download_url, creamos botón
+          if(pl.download_url){
+            const link = document.createElement('a');
+            link.className = 'download-btn';
+            link.href = pl.download_url;
+            link.textContent = '⬇️ Instalar/Descargar';
+            link.setAttribute('download', pl.filename || '');
+            it.downloadArea.innerHTML = '';
+            it.downloadArea.appendChild(link);
+          } else {
+            // si no hay download_url pero sí tenemos chunks (binary streaming), ensamblar Blob
+            if(it.chunks && it.chunks.length){
+              finalizeBlobFor(it);
+            }
+          }
+          log(`✅ Completado: ${name}`);
+          break;
+        }
+        case 'install_prompt': {
+          const pl = obj.payload || {};
+          const msg = `Instalar: ${pl.filename} -> ${pl.download_url || '-'}`;
+          log(`INSTALL_PROMPT: ${msg}`);
+          break;
+        }
+        default:
+          log('MSG tipo desconocido: ' + JSON.stringify(obj));
+      }
+    }
+
+    // Si el servidor envía binarios en streaming (no usa uploads/ HTTP),
+    // acumulamos ArrayBuffers y al finalizar creamos un Blob.
+    function handleBinaryChunk(chunkArrayBuffer, currentFilenameGuess){
+      // Si server sent an explicit file name earlier, use it; otherwise use guess
+      const fname = currentFilenameGuess || (transfers.keys().next().value || 'archivo.bin');
+      const it = ensureUIForFile(fname);
+      it.chunks.push(chunkArrayBuffer);
+      it.received += chunkArrayBuffer.byteLength;
+
+      // update UI if total known
+      if(it.totalSize){
+        const perc = Math.min(100, (it.received / it.totalSize) * 100);
+        it.innerBar.style.width = perc + '%';
+        it.p.textContent = (perc.toFixed(2) || '0') + '%';
+        it.s.textContent = human(it.received) + ' / ' + human(it.totalSize);
+        const elapsed = Math.max(1, (Date.now() - it.startedAt) / 1000);
+        const speed = (it.received / (1024*1024)) / elapsed;
+        it.v.textContent = speed.toFixed(2) + ' MB/s';
+        it.st.textContent = 'Transfiriendo...';
+      } else {
+        // unknown total -> show received bytes
+        it.s.textContent = human(it.received) + ' / ?';
+      }
+    }
+
+    // Ensamblar Blob y crear enlace de descarga
+    function finalizeBlobFor(it){
+      try {
+        const blob = new Blob(it.chunks, { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.className = 'download-btn';
+        link.href = url;
+        link.download = it.filename || 'archivo.bin';
+        link.textContent = '⬇️ Instalar/Descargar';
+        it.downloadArea.innerHTML = '';
+        it.downloadArea.appendChild(link);
+        it.st.textContent = '✅ Listo para descargar';
+        log(`Blob creado para ${it.filename} — ${human(it.received)}`);
+      } catch (e){
+        log('ERROR creando blob: ' + e);
+      }
+    }
+
+    // Eventos WS
+    function connectWebSocket(){
+      if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        log('Ya conectado o intentando conectar...');
+        return;
+      }
+
+      const url = 'ws://' + location.hostname + ':' + WS_PORT;
+      log('Conectando a ' + url + ' ...');
+      setWSState('conectando...');
+      ws = new WebSocket(url);
+      // IMPORTANT: recibir binario como ArrayBuffer
+      ws.binaryType = 'arraybuffer';
+
+      ws.addEventListener('open', () => {
+        connectedAt = Date.now();
+        setWSState('conectado','ok');
+        log('WebSocket abierto.');
+        // identificamos como browser (el servidor espera esto)
+        try { ws.send(JSON.stringify({type:'identification', client_type:'browser'})); } catch(e){}
+      });
+
+      ws.addEventListener('close', (ev) => {
+        setWSState('cerrado','err');
+        log('WebSocket cerrado. code=' + (ev.code || '-') + ' reason=' + (ev.reason || '-'));
+        // limpiar conexiones parciales
+        // reintentar automaticamente
+        setTimeout(() => {
+          log('Reintentando conexión...');
+          connectWebSocket();
+        }, RECONNECT_DELAY);
+      });
+
+      ws.addEventListener('error', (ev) => {
+        setWSState('error','err');
+        log('Error WebSocket (ver consola).');
+      });
+
+      // Mensajes (puede ser JSON o ArrayBuffer)
+      ws.addEventListener('message', (ev) => {
+        // Si es string, intentar parsear JSON
+        if(typeof ev.data === 'string'){
+          try {
+            const obj = JSON.parse(ev.data);
+            handleControlMessage(obj);
+            return;
+          } catch(e){
+            // no JSON -> mostrar raw
+            log('RAW string: ' + ev.data);
+            return;
+          }
+        }
+
+        // Si es binario (ArrayBuffer) -> manejar chunk
+        if(ev.data instanceof ArrayBuffer){
+          // no tenemos filename explícito en el frame binario,
+          // asumimos que antes hubo upload_start con payload.filename.
+          // Tomamos el último transfer que tenga estado 'Transfiriendo...' o el último añadido.
+          let lastIt = null;
+          // Priorizar transferes que no hayan finalizado y tengan startedAt
+          for (let it of transfers.values()){
+            if(it.startedAt && (it.root.classList.contains('done') === false)){
+              lastIt = it;
+              break;
+            }
+          }
+          if(!lastIt){
+            // fallback: el último insertado
+            const keys = Array.from(transfers.keys());
+            if(keys.length) lastIt = transfers.get(keys[0]);
+          }
+          // push chunk
+          handleBinaryChunk(ev.data, lastIt ? lastIt.filename : undefined);
+        } else {
+          // otros tipos (Blob en algunos navegadores) -> convertir a ArrayBuffer
+          if(ev.data instanceof Blob){
+            ev.data.arrayBuffer().then(ab => {
+              // reusar la misma lógica
+              let lastIt = null;
+              for (let it of transfers.values()){
+                if(it.startedAt && (it.root.classList.contains('done') === false)){
+                  lastIt = it;
+                  break;
+                }
+              }
+              handleBinaryChunk(ab, lastIt ? lastIt.filename : undefined);
+            }).catch(err => {
+              log('ERROR leyendo Blob: ' + err);
+            });
+          } else {
+            log('Mensaje no manejado (tipo extraño).');
+          }
+        }
+      });
+    }
+
+    // Botones
+    btnConnect.addEventListener('click', () => {
+      connectWebSocket();
+    });
+
+    btnRefresh.addEventListener('click', () => {
+      log('Refrescar estado (reconectar si es necesario).');
+      if(!ws || ws.readyState !== WebSocket.OPEN){
+        connectWebSocket();
+      } else {
+        try { ws.send(JSON.stringify({type:'status_request'})); } catch(e){ log('No se pudo pedir estado: ' + e); }
+      }
+    });
+
+    // Conectar al cargar
+    connectWebSocket();
+
+    // Exponer util en consola para debug
+    window.__transfers = transfers;
+    window.__ws = () => ws;
+    window.__log = log;
+  })();
+  </script>
+</body>
+</html>
